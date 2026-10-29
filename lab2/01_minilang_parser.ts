@@ -32,27 +32,33 @@
 // ---------- Grammar (EBNF). Edit this first in every step. [for core assignments] ----------
 //   expr    = "if" expr "then" expr "else" expr | compare ;
 //   compare = sum [ ">" sum ] ;
-//   sum = term { ( "+" | "-" ) term } ;
-//   term= primary { "*" primary } ;
+//   sum     = term { ( "+" | "-" ) term } ;
+//   term    = primary { "*" primary } ;
 //   primary = INT | STRING | IDENT | "(" expr ")" ;
-// 
-//  ---------- Grammar (EBNF). Edit this first in every step. [for home assignments] ----------
-// expr    = "if" expr "then" expr "else" expr | compare ;
-// compare = sum [ ( ">" | ">=" | "==" ) sum ] ;
-// sum     = term { ( "+" | "-" ) term } ;
-// term    = unary { "*" unary } ;
-// unary   = "-" unary | primary ;
-// primary = INT | STRING | IDENT | "true" | "false" | "(" expr ")" ;
-// 
+//
+// ---------- Grammar (EBNF). Edit this first in every step. [for home assignments] ----------
+//   expr    = "if" expr "then" expr "else" expr | compare ;
+//   compare = sum [ ( ">" | ">=" | "==" ) sum ] ;
+//   sum     = term { ( "+" | "-" ) term } ;
+//   term    = unary { "*" unary } ;
+//   unary   = "-" unary | primary ;
+//   primary = INT | STRING | IDENT | "true" | "false" | "(" expr ")" ;
+//
 // Pipeline:  source text --tokenize--> Token[] --parse--> Expr --check--> Type
 
 // ---------- AST: the Lab 1 Expr type (slide 12) ----------
 type Expr =
   | { kind: "int"; value: number }
   | { kind: "str"; value: string }
+  | { kind: "bool"; value: boolean }
   | { kind: "var"; name: string }
+  | { kind: "neg"; operand: Expr }
   | { kind: "add"; left: Expr; right: Expr }
+  | { kind: "sub"; left: Expr; right: Expr }
+  | { kind: "mul"; left: Expr; right: Expr }
   | { kind: "gt"; left: Expr; right: Expr }
+  | { kind: "ge"; left: Expr; right: Expr }
+  | { kind: "eq"; left: Expr; right: Expr }
   | { kind: "if"; cond: Expr; then: Expr; else: Expr };
 
 // ---------- Lexer: token rules (slide 7) and the tokenizer loop (slide 8) ----------
@@ -64,11 +70,15 @@ const RULES: [string, RegExp][] = [
   ["ident", /[A-Za-z_]\w*/y],
   ["str",   /"[^"]*"/y],
   ["+",     /\+/y],
+  ["-",     /-/y],
+  ["*",     /\*/y],
+  [">=",    />=/y],
   [">",     />/y],
+  ["==",    /==/y],
   ["(",     /\(/y],
   [")",     /\)/y],
 ];
-const KW = new Set(["if", "then", "else"]);
+const KW = new Set(["if", "then", "else", "true", "false"]);
 
 function tokenize(src: string): Token[] {
   const out: Token[] = [];
@@ -130,30 +140,58 @@ function parseExpr(p: Parser): Expr {
   return { kind: "if", cond, then: thenE, else: parseExpr(p) };
 }
 
-// compare = sum [ ">" sum ] ;
+// compare = sum [ ( ">" | ">=" | "==" ) sum ] ;
 function parseCompare(p: Parser): Expr {
   const left = parseSum(p);
-  if (p.peek().kind !== ">") return left;
-  p.next();
-  return { kind: "gt", left, right: parseSum(p) };
-}
-
-// sum = primary { "+" primary } ;
-function parseSum(p: Parser): Expr {
-  let left = parsePrimary(p);
-  while (p.peek().kind === "+") {
+  const k = p.peek().kind;
+  if (k === ">" || k === ">=" || k === "==") {
     p.next();
-    left = { kind: "add", left, right: parsePrimary(p) };
+    const right = parseSum(p);
+    if (k === ">") return { kind: "gt", left, right };
+    if (k === ">=") return { kind: "ge", left, right };
+    return { kind: "eq", left, right };
   }
   return left;
 }
 
-// primary = INT | STRING | IDENT | "(" expr ")" ;
+// sum = term { ( "+" | "-" ) term } ;
+function parseSum(p: Parser): Expr {
+  let left = parseTerm(p);
+  while (p.peek().kind === "+" || p.peek().kind === "-") {
+    const op = p.next().kind;
+    const right = parseTerm(p);
+    left = op === "+" ? { kind: "add", left, right } : { kind: "sub", left, right };
+  }
+  return left;
+}
+
+// term = unary { "*" unary } ;
+function parseTerm(p: Parser): Expr {
+  let left = parseUnary(p);
+  while (p.peek().kind === "*") {
+    p.next();
+    left = { kind: "mul", left, right: parseUnary(p) };
+  }
+  return left;
+}
+
+// unary = "-" unary | primary ;
+function parseUnary(p: Parser): Expr {
+  if (p.peek().kind === "-") {
+    p.next();
+    return { kind: "neg", operand: parseUnary(p) };
+  }
+  return parsePrimary(p);
+}
+
+// primary = INT | STRING | IDENT | "true" | "false" | "(" expr ")" ;
 function parsePrimary(p: Parser): Expr {
   const t = p.next();
   switch (t.kind) {
     case "int":   return { kind: "int", value: Number(t.text) };
     case "str":   return { kind: "str", value: t.text.slice(1, -1) };
+    case "true":  return { kind: "bool", value: true };
+    case "false": return { kind: "bool", value: false };
     case "ident": return { kind: "var", name: t.text };
     case "(": { const e = parseExpr(p); p.expect(")"); return e; }
     default: throw new Error(`unexpected ${t.kind} at ${t.pos}`);
@@ -175,10 +213,17 @@ function check(e: Expr, env: Env): Type {
       return "int";
     case "str": // T-Str
       return "string";
+    case "bool": // T-Bool
+      return "bool";
     case "var": { // T-Var
       const t = env[e.name];
       if (t === undefined) throw new CheckError(`unbound variable '${e.name}'`);
       return t;
+    }
+    case "neg": { // T-Neg
+      const t = check(e.operand, env);
+      if (t !== "int") throw new CheckError(`unary '-' needs int, got -${t}`);
+      return "int";
     }
     case "add": { // T-Add-Int and T-Add-Str
       const l = check(e.left, env);
@@ -187,10 +232,34 @@ function check(e: Expr, env: Env): Type {
       if (l === "string" && r === "string") return "string";
       throw new CheckError(`'+' needs int + int or string + string, got ${l} + ${r}`);
     }
+    case "sub": { // T-Sub
+      const l = check(e.left, env);
+      const r = check(e.right, env);
+      if (l !== "int" || r !== "int") throw new CheckError(`'-' needs int - int, got ${l} - ${r}`);
+      return "int";
+    }
+    case "mul": { // T-Mul
+      const l = check(e.left, env);
+      const r = check(e.right, env);
+      if (l !== "int" || r !== "int") throw new CheckError(`'*' needs int * int, got ${l} * ${r}`);
+      return "int";
+    }
     case "gt": { // T-Gt
       const l = check(e.left, env);
       const r = check(e.right, env);
       if (l !== "int" || r !== "int") throw new CheckError(`'>' needs int > int, got ${l} > ${r}`);
+      return "bool";
+    }
+    case "ge": { // T-Ge
+      const l = check(e.left, env);
+      const r = check(e.right, env);
+      if (l !== "int" || r !== "int") throw new CheckError(`'>=' needs int >= int, got ${l} >= ${r}`);
+      return "bool";
+    }
+    case "eq": { // T-Eq
+      const l = check(e.left, env);
+      const r = check(e.right, env);
+      if (l !== r) throw new CheckError(`'==' needs matching types, got ${l} == ${r}`);
       return "bool";
     }
     case "if": { // T-If
