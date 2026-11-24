@@ -1,0 +1,213 @@
+// MIDTERM C2-4 · let-expressions: lexer, parser and rule T-Let                 (about 20 min)
+//
+// Starting point: the MiniLang parser and checker from Lab 2, core steps already done (-, *, T-Sub, T-Mul).
+// Add local names (Lecture 4):     let x = 5 in x + 1
+// Already done for you: the GRAMMAR comment below and the new Expr kind "let" (see the AST).
+//
+//   Task 1  Lexer: the token  =  and the keywords  let  and  in .   "letter"  and  "inx"  stay identifiers.
+//           Hint: keywords go into the KW set, not into RULES.
+//   Task 2  Parser: in parseExpr, parse   "let" IDENT "=" expr "in" expr
+//           and return  { kind: "let", name, value, body } .
+//   Task 3  Typing rule  T-Let  (replace the TODO in check()):
+//                                    Gamma |- e1 : T1      Gamma, x : T1 |- e2 : T2
+//                                    ------------------------------------------------
+//                                          Gamma |- let x = e1 in e2 : T2
+//           The new binding exists in the body ONLY, and it may shadow an outer x.
+//           Do not change the caller's environment object: build a new one.
+//
+// Rules: no  any , no  as , no  ! , no  @ts-ignore . The tests below the editor are read-only.
+// Grading also uses hidden tests of the same kind: do not hard-code answers for the visible inputs.
+//
+// GRAMMAR (EBNF)
+//   expr    = "let" IDENT "=" expr "in" expr
+//           | "if" expr "then" expr "else" expr | compare ;
+//   compare = sum [ ">" sum ] ;
+//   sum     = term { ("+" | "-") term } ;
+//   term    = primary { "*" primary } ;
+//   primary = INT | STRING | IDENT | "(" expr ")" ;
+
+// ---------- AST ----------
+type Expr =
+  | { kind: "int"; value: number }
+  | { kind: "str"; value: string }
+  | { kind: "var"; name: string }
+  | { kind: "add"; left: Expr; right: Expr }
+  | { kind: "sub"; left: Expr; right: Expr }
+  | { kind: "mul"; left: Expr; right: Expr }
+  | { kind: "gt"; left: Expr; right: Expr }
+  | { kind: "if"; cond: Expr; then: Expr; else: Expr }
+  | { kind: "let"; name: string; value: Expr; body: Expr };
+
+// ---------- Lexer ----------
+type Token = { kind: string; text: string; pos: number };
+
+const RULES: [string, RegExp][] = [
+  ["ws",    /\s+/y],
+  ["int",   /[0-9]+/y],
+  ["ident", /[A-Za-z_]\w*/y],
+  ["str",   /"[^"]*"/y],
+  ["+",     /\+/y],
+  ["-",     /-/y],
+  ["*",     /\*/y],
+  [">",     />/y],
+  ["=",     /=/y],
+  ["(",     /\(/y],
+  [")",     /\)/y],
+];
+const KW = new Set(["if", "then", "else", "let", "in"]);
+
+function tokenize(src: string): Token[] {
+  const out: Token[] = [];
+  let pos = 0;
+  while (pos < src.length) {
+    const t = matchAt(src, pos);
+    if (t.kind !== "ws") out.push(t);
+    pos += t.text.length;
+  }
+  out.push({ kind: "eof", text: "", pos });
+  return out;
+}
+
+function matchAt(src: string, pos: number): Token {
+  for (const [kind, re] of RULES) {
+    re.lastIndex = pos; // sticky: match exactly at pos
+    const m = re.exec(src);
+    if (m === null) continue;
+    const k = kind === "ident" && KW.has(m[0]) ? m[0] : kind;
+    return { kind: k, text: m[0], pos };
+  }
+  throw new Error(`bad character '${src[pos]}' at ${pos}`);
+}
+
+// ---------- Parser state ----------
+class Parser {
+  private i = 0;
+  private tokens: Token[];
+  constructor(tokens: Token[]) { this.tokens = tokens; }
+  peek(): Token { return this.tokens[this.i]; }
+  next(): Token { return this.tokens[this.i++]; }
+  expect(kind: string): Token {
+    const t = this.next();
+    if (t.kind !== kind) throw new Error(`expected ${kind} at ${t.pos}`);
+    return t;
+  }
+}
+
+function parse(src: string): Expr {
+  const p = new Parser(tokenize(src));
+  const e = parseExpr(p);
+  p.expect("eof");
+  return e;
+}
+
+// expr = "let" IDENT "=" expr "in" expr | "if" expr "then" expr "else" expr | compare ;
+function parseExpr(p: Parser): Expr {
+  if (p.peek().kind === "let") {
+    p.next();
+    const name = p.expect("ident").text;
+    p.expect("=");
+    const value = parseExpr(p);
+    p.expect("in");
+    const body = parseExpr(p);
+    return { kind: "let", name, value, body };
+  }
+  if (p.peek().kind !== "if") return parseCompare(p);
+  p.next();
+  const cond = parseExpr(p);
+  p.expect("then");
+  const thenE = parseExpr(p);
+  p.expect("else");
+  return { kind: "if", cond, then: thenE, else: parseExpr(p) };
+}
+
+// compare = sum [ ">" sum ] ;
+function parseCompare(p: Parser): Expr {
+  const left = parseSum(p);
+  if (p.peek().kind !== ">") return left;
+  p.next();
+  return { kind: "gt", left, right: parseSum(p) };
+}
+
+// sum = term { ("+" | "-") term } ;
+function parseSum(p: Parser): Expr {
+  let left = parseTerm(p);
+  while (p.peek().kind === "+" || p.peek().kind === "-") {
+    const op = p.next().kind;
+    const right = parseTerm(p);
+    left = op === "+" ? { kind: "add", left, right } : { kind: "sub", left, right };
+  }
+  return left;
+}
+
+// term = primary { "*" primary } ;
+function parseTerm(p: Parser): Expr {
+  let left = parsePrimary(p);
+  while (p.peek().kind === "*") {
+    p.next();
+    left = { kind: "mul", left, right: parsePrimary(p) };
+  }
+  return left;
+}
+
+// primary = INT | STRING | IDENT | "(" expr ")" ;
+function parsePrimary(p: Parser): Expr {
+  const t = p.next();
+  switch (t.kind) {
+    case "int":   return { kind: "int", value: Number(t.text) };
+    case "str":   return { kind: "str", value: t.text.slice(1, -1) };
+    case "ident": return { kind: "var", name: t.text };
+    case "(": { const e = parseExpr(p); p.expect(")"); return e; }
+    default: throw new Error(`unexpected ${t.kind} at ${t.pos}`);
+  }
+}
+
+// ---------- Type checker ----------
+type Type = "int" | "string" | "bool";
+type Env = { [variable: string]: Type | undefined };
+class CheckError extends Error {}
+
+function assertNever(x: never): never {
+  throw new Error("check() has no case for: " + JSON.stringify(x));
+}
+
+function checkInts(e: { left: Expr; right: Expr }, env: Env, op: string): void {
+  const l = check(e.left, env);
+  const r = check(e.right, env);
+  if (l !== "int" || r !== "int") throw new CheckError(`'${op}' needs int ${op} int, got ${l} ${op} ${r}`);
+}
+
+function check(e: Expr, env: Env): Type {
+  switch (e.kind) {
+    case "int": return "int";                                    // T-Int
+    case "str": return "string";                                 // T-Str
+    case "var": {                                                // T-Var
+      const t = env[e.name];
+      if (t === undefined) throw new CheckError(`unbound variable '${e.name}'`);
+      return t;
+    }
+    case "add": {                                                // T-Add-Int, T-Add-Str
+      const l = check(e.left, env);
+      const r = check(e.right, env);
+      if (l === "int" && r === "int") return "int";
+      if (l === "string" && r === "string") return "string";
+      throw new CheckError(`'+' needs int + int or string + string, got ${l} + ${r}`);
+    }
+    case "sub": checkInts(e, env, "-"); return "int";            // T-Sub
+    case "mul": checkInts(e, env, "*"); return "int";            // T-Mul
+    case "gt":  checkInts(e, env, ">"); return "bool";           // T-Gt
+    case "if": {                                                 // T-If
+      const c = check(e.cond, env);
+      if (c !== "bool") throw new CheckError(`if condition must be bool, got ${c}`);
+      const t1 = check(e.then, env);
+      const t2 = check(e.else, env);
+      if (t1 !== t2) throw new CheckError(`if branches differ: then is ${t1}, else is ${t2}`);
+      return t1;
+    }
+    case "let": {                                                // T-Let
+      const t1 = check(e.value, env);
+      return check(e.body, { ...env, [e.name]: t1 });
+    }
+    default:
+      return assertNever(e);
+  }
+}
